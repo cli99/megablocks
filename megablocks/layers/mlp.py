@@ -8,7 +8,7 @@ from megablocks import grouped_gemm_util as gg
 import stk
 import torch
 import torch.nn.functional as F
-
+import ctypes
 
 class ScaleGradient(torch.autograd.Function):
 
@@ -23,7 +23,6 @@ class ScaleGradient(torch.autograd.Function):
     def backward(ctx, grad):
         return grad * ctx.scale, None
 scale_gradient = ScaleGradient.apply
-
 
 def create_moe_expert_weights(args : Arguments,
                               num_experts : int,
@@ -375,20 +374,19 @@ class SparseMLP(torch.nn.Module):
         x = stk.ops.sdd(x, w1.t(), topo)
         return stk.ops.dsd(gelu.gelu(x), w2)
 
-
 class MemoryOptimizedGroupedMLP(torch.autograd.Function):
     """GroupedMLP with manually scheduled memory reuse."""
 
     @staticmethod
     @torch.cuda.amp.custom_fwd
-    def forward(ctx, x, w1, w2, batch_sizes, num_input_bits, num_remat_bits):
+    def forward(ctx, x, w1, w2, batch_sizes, num_input_bits, num_remat_bits, s0, s1, s2, s3):
         # x: [m, k], w1: [n, k], w2: [n, k]
         if (not x.is_contiguous() or not w1.is_contiguous() or
             not w2.is_contiguous()):
             raise ValueError("Expected contiguous 'x', 'w1' and 'w2'.")
 
         # Layer 0: x @ w1.t().
-        sdd_out = gg.backend.gmm(x, w1, batch_sizes, trans_b=True)
+        sdd_out = gg.backend.gmm(x, w1, batch_sizes, s0, s1, s2, s3, trans_b=True)
 
         # Save input tensor, quantizing if needed
         input_save_args = (x,)
@@ -409,7 +407,12 @@ class MemoryOptimizedGroupedMLP(torch.autograd.Function):
             input_save_args += (hidden_q, hidden_scales)
 
         # Layer 1: x @ w2.
-        dsd_out = gg.backend.gmm(gelu_out, w2, batch_sizes)
+        dsd_out = gg.backend.gmm(gelu_out, w2, batch_sizes, s0, s1, s2, s3)
+
+        s0.synchronize()
+        s1.synchronize()
+        s2.synchronize()
+        s3.synchronize()
 
         # NOTE: Save the input to the layer and the gelu input for
         # gradient computation. We'll re-compute the gelu forward
@@ -501,6 +504,13 @@ memory_optimized_grouped_mlp = MemoryOptimizedGroupedMLP.apply
 
 
 class GroupedMLP(SparseMLP):
+    def __init__(self, args : Arguments):
+        super().__init__(args)
+        priority=-1
+        self._s0 = torch.cuda.Stream(priority=priority)
+        self._s1 = torch.cuda.Stream(priority=priority)
+        self._s2 = torch.cuda.Stream(priority=priority)
+        self._s3 = torch.cuda.Stream(priority=priority)
 
     def forward(self, x, tokens_per_expert):
         batch_sizes = tokens_per_expert.cpu().to(torch.long)
@@ -519,7 +529,7 @@ class GroupedMLP(SparseMLP):
             return memory_optimized_grouped_mlp(
                 x, w1, w2, batch_sizes,
                 self.args.quantize_inputs_num_bits,
-                self.args.quantize_rematerialize_num_bits)
+                self.args.quantize_rematerialize_num_bits, self._s0, self._s1, self._s2, self._s3)
 
         # Compute the MLP.
         x = gg.ops.gmm(x, w1, batch_sizes, trans_b=True)

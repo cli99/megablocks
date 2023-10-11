@@ -24,9 +24,15 @@ def benchmark_function(fn, iterations=100, warmup=10):
         end = torch.cuda.Event(enable_timing=True)
 
         start.record()
+        # with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]) as prof:
+            # for _ in range(5):
+                # fn()
         fn()
         end.record()
-        
+
         torch.cuda.synchronize()
         times.append(start.elapsed_time(end))
+        # if torch.distributed.get_rank() == 0:
+            # prof.export_chrome_trace("trace_ps.json")
+        # break
     return np.mean(times), np.std(times)
