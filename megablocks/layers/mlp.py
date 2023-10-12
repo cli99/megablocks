@@ -380,6 +380,10 @@ class MemoryOptimizedGroupedMLP(torch.autograd.Function):
     @staticmethod
     @torch.cuda.amp.custom_fwd
     def forward(ctx, x, w1, w2, batch_sizes, num_input_bits, num_remat_bits, s0, s1, s2, s3):
+        ctx.s0 = s0
+        ctx.s1 = s1
+        ctx.s2 = s2
+        ctx.s3 = s3
         # x: [m, k], w1: [n, k], w2: [n, k]
         if (not x.is_contiguous() or not w1.is_contiguous() or
             not w2.is_contiguous()):
@@ -394,6 +398,11 @@ class MemoryOptimizedGroupedMLP(torch.autograd.Function):
             x_q, x_scales = turbo.quantize_signed(x, num_bits=num_input_bits)
             input_save_args = (x_q, x_scales)
 
+        s0.synchronize()
+        s1.synchronize()
+        s2.synchronize()
+        s3.synchronize()
+
         # GeLU.
         if num_remat_bits == -1:
             gelu_out = F.gelu(sdd_out, approximate="tanh")
@@ -405,6 +414,8 @@ class MemoryOptimizedGroupedMLP(torch.autograd.Function):
                 op=turbo.ElemwiseOps.GELU_FORWARD, x_forward=sdd_out)
             gelu_out = sdd_out
             input_save_args += (hidden_q, hidden_scales)
+
+        torch.cuda.current_stream().synchronize()
 
         # Layer 1: x @ w2.
         dsd_out = gg.backend.gmm(gelu_out, w2, batch_sizes, s0, s1, s2, s3)
@@ -429,6 +440,11 @@ class MemoryOptimizedGroupedMLP(torch.autograd.Function):
     @staticmethod
     @torch.cuda.amp.custom_bwd
     def backward(ctx, ddsd_out):
+        s0 = ctx.s0
+        s1 = ctx.s1
+        s2 = ctx.s2
+        s3 = ctx.s3
+
         if (not ctx.needs_input_grad[0] or
             not ctx.needs_input_grad[1] or
             not ctx.needs_input_grad[2]):
@@ -461,16 +477,22 @@ class MemoryOptimizedGroupedMLP(torch.autograd.Function):
                 op=turbo.ElemwiseOps.GELU_FORWARD,
                 out_shape=ctx.sdd_out_shape, out_dtype=dtype)
 
+        torch.cuda.current_stream().synchronize()
+
         # Compute dw2 with recomputed gelu output.
         dw2 = gg.backend.gmm(
-            gelu_out, ddsd_out, batch_sizes, trans_a=True)
+            gelu_out, ddsd_out, batch_sizes,  s0, s1, s2, s3, trans_a=True)
 
         # Compute dgelu_out.
         #
         # NOTE: We reuse the gelu_out allocation.
         gg.backend.gmm(
-            ddsd_out, w2, batch_sizes, trans_b=True, c=gelu_out)
+            ddsd_out, w2, batch_sizes,  s0, s1, s2, s3, trans_b=True, c=gelu_out)
         dgelu_out = gelu_out
+        s0.synchronize()
+        s1.synchronize()
+        s2.synchronize()
+        s3.synchronize()
 
         # Compute dsdd_out.
         #
@@ -490,14 +512,22 @@ class MemoryOptimizedGroupedMLP(torch.autograd.Function):
                 x_q, x_scales, num_bits=ctx.num_input_bits,
                 out_dtype=dtype, out_shape=ctx.x_shape)
 
+        torch.cuda.current_stream().synchronize()
+
         # Compute dw1.
-        dw1 = gg.backend.gmm(dsdd_out, x, batch_sizes, trans_a=True)
+        dw1 = gg.backend.gmm(dsdd_out, x, batch_sizes,  s0, s1, s2, s3, trans_a=True)
 
         # Compute dx.
         #
         # NOTE: This reuses the ddsd_out allocation.
         gg.backend.gmm(dsdd_out, w1, batch_sizes, c=ddsd_out)
         dx = ddsd_out
+        s0.synchronize()
+        s1.synchronize()
+        s2.synchronize()
+        s3.synchronize()
+
+
         return dx, dw1, dw2, None, None, None
 
 memory_optimized_grouped_mlp = MemoryOptimizedGroupedMLP.apply
@@ -532,6 +562,19 @@ class GroupedMLP(SparseMLP):
                 self.args.quantize_rematerialize_num_bits, self._s0, self._s1, self._s2, self._s3)
 
         # Compute the MLP.
-        x = gg.ops.gmm(x, w1, batch_sizes, trans_b=True)
+        x = gg.ops.gmm(x, w1, batch_sizes, self._s0, self._s1, self._s2, self._s3, trans_b=True)
+        s0.synchronize()
+        s1.synchronize()
+        s2.synchronize()
+        s3.synchronize()
+
         x = F.gelu(x, approximate="tanh")
-        return gg.ops.gmm(x, w2, batch_sizes)
+        torch.cuda.current_stream().synchronize()
+
+        ret =  gg.ops.gmm(x, w2, batch_sizes, self._s0, self._s1, self._s2, self._s3)
+        s0.synchronize()
+        s1.synchronize()
+        s2.synchronize()
+        s3.synchronize()
+
+        return ret
