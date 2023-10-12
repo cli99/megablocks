@@ -419,7 +419,6 @@ class MemoryOptimizedGroupedMLP(torch.autograd.Function):
 
         # Layer 1: x @ w2.
         dsd_out = gg.backend.gmm(gelu_out, w2, batch_sizes, s0, s1, s2, s3)
-
         s0.synchronize()
         s1.synchronize()
         s2.synchronize()
@@ -477,22 +476,28 @@ class MemoryOptimizedGroupedMLP(torch.autograd.Function):
                 op=turbo.ElemwiseOps.GELU_FORWARD,
                 out_shape=ctx.sdd_out_shape, out_dtype=dtype)
 
-        torch.cuda.current_stream().synchronize()
+        torch.cuda.synchronize()
 
         # Compute dw2 with recomputed gelu output.
         dw2 = gg.backend.gmm(
             gelu_out, ddsd_out, batch_sizes,  s0, s1, s2, s3, trans_a=True)
+        # s0.synchronize()
+        # s1.synchronize()
+        # s2.synchronize()
+        # s3.synchronize()
 
+        # torch.cuda.synchronize()
         # Compute dgelu_out.
         #
         # NOTE: We reuse the gelu_out allocation.
         gg.backend.gmm(
-            ddsd_out, w2, batch_sizes,  s0, s1, s2, s3, trans_b=True, c=gelu_out)
-        dgelu_out = gelu_out
+            ddsd_out, w2, batch_sizes, s0, s1, s2, s3, trans_b=True, c=gelu_out)
         s0.synchronize()
         s1.synchronize()
         s2.synchronize()
         s3.synchronize()
+        dgelu_out = gelu_out
+        # torch.cuda.current_stream().synchronize()
 
         # Compute dsdd_out.
         #
@@ -515,20 +520,31 @@ class MemoryOptimizedGroupedMLP(torch.autograd.Function):
         torch.cuda.current_stream().synchronize()
 
         # Compute dw1.
-        dw1 = gg.backend.gmm(dsdd_out, x, batch_sizes,  s0, s1, s2, s3, trans_a=True)
+        dw1 = gg.backend.gmm(dsdd_out, x, batch_sizes, s0, s1, s2, s3, trans_a=True)
+        # s0.synchronize()
+        # s1.synchronize()
+        # s2.synchronize()
+        # s3.synchronize()
+
+        gg.backend.gmm(dsdd_out, w1, batch_sizes, s0, s1, s2, s3, c=ddsd_out)
+        # s0.synchronize()
+        # s1.synchronize()
+        # s2.synchronize()
+        # s3.synchronize()
 
         # Compute dx.
         #
         # NOTE: This reuses the ddsd_out allocation.
-        gg.backend.gmm(dsdd_out, w1, batch_sizes, c=ddsd_out)
-        dx = ddsd_out
+        gg.backend.gmm(dsdd_out, w1, batch_sizes, s0, s1, s2, s3, c=ddsd_out)
         s0.synchronize()
         s1.synchronize()
         s2.synchronize()
         s3.synchronize()
+        dx = ddsd_out
 
+        # torch.cuda.current_stream().synchronize()
 
-        return dx, dw1, dw2, None, None, None
+        return dx, dw1, dw2, None, None, None, None, None, None, None
 
 memory_optimized_grouped_mlp = MemoryOptimizedGroupedMLP.apply
 
