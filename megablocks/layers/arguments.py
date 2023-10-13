@@ -48,6 +48,11 @@ class Arguments:
     init_method : InitFn =  partial(torch.nn.init.normal_, mean=0.0, std=0.02)
     output_layer_init_method : InitFn = init_method
 
+    s0: torch.cuda.Stream = torch.cuda.Stream()
+    s1: torch.cuda.Stream = torch.cuda.Stream()
+    s2: torch.cuda.Stream = torch.cuda.Stream()
+    s3: torch.cuda.Stream = torch.cuda.Stream()
+
     # Benchmarking arguments.
     uniform_expert_assignment : bool = False
 

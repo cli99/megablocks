@@ -398,9 +398,9 @@ class MemoryOptimizedGroupedMLP(torch.autograd.Function):
             x_q, x_scales = turbo.quantize_signed(x, num_bits=num_input_bits)
             input_save_args = (x_q, x_scales)
 
-        s0.synchronize()
+        # s0.synchronize()
         s1.synchronize()
-        s2.synchronize()
+        #s2.synchronize()
         s3.synchronize()
 
         # GeLU.
@@ -419,9 +419,9 @@ class MemoryOptimizedGroupedMLP(torch.autograd.Function):
 
         # Layer 1: x @ w2.
         dsd_out = gg.backend.gmm(gelu_out, w2, batch_sizes, s0, s1, s2, s3)
-        s0.synchronize()
+        # s0.synchronize()
         s1.synchronize()
-        s2.synchronize()
+        #s2.synchronize()
         s3.synchronize()
 
         # NOTE: Save the input to the layer and the gelu input for
@@ -476,28 +476,26 @@ class MemoryOptimizedGroupedMLP(torch.autograd.Function):
                 op=turbo.ElemwiseOps.GELU_FORWARD,
                 out_shape=ctx.sdd_out_shape, out_dtype=dtype)
 
-        torch.cuda.synchronize()
+        torch.cuda.current_stream().synchronize()
 
         # Compute dw2 with recomputed gelu output.
         dw2 = gg.backend.gmm(
             gelu_out, ddsd_out, batch_sizes,  s0, s1, s2, s3, trans_a=True)
         # s0.synchronize()
-        # s1.synchronize()
-        # s2.synchronize()
-        # s3.synchronize()
+        s1.synchronize()
+        #s2.synchronize()
+        s3.synchronize()
 
-        # torch.cuda.synchronize()
         # Compute dgelu_out.
         #
         # NOTE: We reuse the gelu_out allocation.
         gg.backend.gmm(
             ddsd_out, w2, batch_sizes, s0, s1, s2, s3, trans_b=True, c=gelu_out)
-        s0.synchronize()
+        # s0.synchronize()
         s1.synchronize()
-        s2.synchronize()
+        #s2.synchronize()
         s3.synchronize()
         dgelu_out = gelu_out
-        # torch.cuda.current_stream().synchronize()
 
         # Compute dsdd_out.
         #
@@ -521,28 +519,18 @@ class MemoryOptimizedGroupedMLP(torch.autograd.Function):
 
         # Compute dw1.
         dw1 = gg.backend.gmm(dsdd_out, x, batch_sizes, s0, s1, s2, s3, trans_a=True)
-        # s0.synchronize()
-        # s1.synchronize()
-        # s2.synchronize()
-        # s3.synchronize()
 
         gg.backend.gmm(dsdd_out, w1, batch_sizes, s0, s1, s2, s3, c=ddsd_out)
-        # s0.synchronize()
-        # s1.synchronize()
-        # s2.synchronize()
-        # s3.synchronize()
 
         # Compute dx.
         #
         # NOTE: This reuses the ddsd_out allocation.
         gg.backend.gmm(dsdd_out, w1, batch_sizes, s0, s1, s2, s3, c=ddsd_out)
-        s0.synchronize()
+        # s0.synchronize()
         s1.synchronize()
-        s2.synchronize()
+        #s2.synchronize()
         s3.synchronize()
         dx = ddsd_out
-
-        # torch.cuda.current_stream().synchronize()
 
         return dx, dw1, dw2, None, None, None, None, None, None, None
 
@@ -552,11 +540,10 @@ memory_optimized_grouped_mlp = MemoryOptimizedGroupedMLP.apply
 class GroupedMLP(SparseMLP):
     def __init__(self, args : Arguments):
         super().__init__(args)
-        priority=-1
-        self._s0 = torch.cuda.Stream(priority=priority)
-        self._s1 = torch.cuda.Stream(priority=priority)
-        self._s2 = torch.cuda.Stream(priority=priority)
-        self._s3 = torch.cuda.Stream(priority=priority)
+        self._s0 = args.s0
+        self._s1 = args.s1
+        self._s2 = args.s2
+        self._s3 = args.s3
 
     def forward(self, x, tokens_per_expert):
         batch_sizes = tokens_per_expert.cpu().to(torch.long)
@@ -579,18 +566,18 @@ class GroupedMLP(SparseMLP):
 
         # Compute the MLP.
         x = gg.ops.gmm(x, w1, batch_sizes, self._s0, self._s1, self._s2, self._s3, trans_b=True)
-        s0.synchronize()
+        # s0.synchronize()
         s1.synchronize()
-        s2.synchronize()
+        #s2.synchronize()
         s3.synchronize()
 
         x = F.gelu(x, approximate="tanh")
         torch.cuda.current_stream().synchronize()
 
         ret =  gg.ops.gmm(x, w2, batch_sizes, self._s0, self._s1, self._s2, self._s3)
-        s0.synchronize()
+        # s0.synchronize()
         s1.synchronize()
-        s2.synchronize()
+        #s2.synchronize()
         s3.synchronize()
 
         return ret
